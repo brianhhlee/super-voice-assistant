@@ -7,11 +7,24 @@ public class GeminiAudioCollector {
     private var webSocketTask: URLSessionWebSocketTask?
     private var didSendSetup: Bool = false
     private let session = URLSession.shared
-    
+    private var isConnecting: Bool = false
+
     public init(apiKey: String) {
         self.apiKey = apiKey
     }
-    
+
+    private func resetConnection() {
+        print("🔄 Resetting WebSocket connection")
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        didSendSetup = false
+        isConnecting = false
+    }
+
+    public func closeConnection() {
+        resetConnection()
+    }
+
     public func collectAudioChunks(from text: String, onComplete: ((Result<Void, Error>) -> Void)? = nil) -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -30,18 +43,35 @@ public class GeminiAudioCollector {
         guard let url = URL(string: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=\(apiKey)") else {
             throw GeminiAudioCollectorError.invalidURL
         }
-        
+
         // Ensure a single, reusable WebSocket connection
-        if webSocketTask == nil {
-            let task = session.webSocketTask(with: url)
-            task.resume()
-            webSocketTask = task
-            didSendSetup = false
+        if webSocketTask == nil || webSocketTask?.state != .running {
+            // Close any existing dead connection
+            if webSocketTask != nil {
+                print("⚠️ WebSocket not running (state: \(webSocketTask?.state.rawValue ?? -1)), creating new connection")
+                resetConnection()
+            }
+
+            // Wait if another task is connecting
+            while isConnecting {
+                try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+
+            // Double-check after waiting
+            if webSocketTask == nil {
+                isConnecting = true
+                print("🔌 Creating new WebSocket connection")
+                let task = session.webSocketTask(with: url)
+                task.resume()
+                webSocketTask = task
+                didSendSetup = false
+                isConnecting = false
+            }
         }
         guard let webSocketTask else {
             throw GeminiAudioCollectorError.invalidURL
         }
-        
+
         do {
             // Send setup message only once per socket
             if !didSendSetup {
@@ -140,8 +170,17 @@ public class GeminiAudioCollector {
             // Notify successful completion before finishing the stream
             onComplete?(.success(()))
             continuation.finish()
-            
+
         } catch {
+            // Check if it's a connection error and reset
+            let nsError = error as NSError
+            if nsError.domain == NSPOSIXErrorDomain && nsError.code == 57 {
+                print("❌ Socket disconnected (POSIX 57), resetting connection for next request")
+                resetConnection()
+            } else if nsError.domain == NSURLErrorDomain {
+                print("❌ Network error (\(nsError.code)), resetting connection")
+                resetConnection()
+            }
             throw GeminiAudioCollectorError.collectionError(error)
         }
     }
